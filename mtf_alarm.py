@@ -58,7 +58,7 @@ POLL_TIMEOUT      = int(os.getenv("POLL_TIMEOUT", "50"))
 
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TG_GROUP = os.getenv("TELEGRAM_GROUP_ID", "-5025422334").strip()
+TG_GROUP = os.getenv("TELEGRAM_GROUP_ID", "-1004439903866").strip()
 
 EXCLUDE = {"BTCDOMUSDT", "DEFIUSDT", "BLUEBIRDUSDT", "BTCSTUSDT"}
 KLINE_LIMIT = TI_LEN + 8
