@@ -72,6 +72,19 @@ POLL_SESSION.headers.update({"User-Agent": "wolf-mtf-alarm-poll/1.1"})
 
 SCAN_LOCK = threading.Lock()       # aynı anda tek tarama
 _last_cmd_ts = 0.0                 # son elle tarama zamanı (cooldown)
+_diag_sent = set()                 # yanlış-grup uyarısı bir kez
+
+def group_matches(cid):
+    """Süpergrup -100 öneki dahil ID eşleştirme (basic<->supergroup biçimi)."""
+    if not TG_GROUP:
+        return True
+    cs = str(cid); g = str(TG_GROUP)
+    cands = {g}
+    if g.startswith("-100"):
+        cands.add("-" + g[4:])        # -100X -> -X
+    elif g.startswith("-"):
+        cands.add("-100" + g[1:])     # -X -> -100X
+    return cs in cands
 
 
 def log(msg):
@@ -410,9 +423,17 @@ def poll_commands():
                     continue
                 cid = msg.get("chat", {}).get("id")
                 # SADECE tanımlı grup; DM/başka sohbet yok say
-                if TG_GROUP and str(cid) != str(TG_GROUP):
-                    log(f"↩ Yetkisiz sohbet {cid} — komut yok sayıldı.")
+                if not group_matches(cid):
+                    if isinstance(cid, int) and cid < 0 and cid not in _diag_sent:
+                        _diag_sent.add(cid)
+                        send_telegram(
+                            f"⚙️ Bu grubun gerçek ID'si: <code>{cid}</code>\n"
+                            f"Ayarlı grup: <code>{TG_GROUP}</code>\n"
+                            f"Eşleşmiyorsa Railway'de <b>TELEGRAM_GROUP_ID={cid}</b> yapıp yeniden deploy et.",
+                            cid)
+                    log(f"↩ Eşleşmeyen sohbet {cid} ({msg.get('chat',{}).get('title','')}) — yok sayıldı.")
                     continue
+                log(f"✅ Komut alındı: {txt!r} · grup {cid}")
                 handle_command(txt, cid)
         except Exception as e:
             log(f"Poll hata: {e}")
