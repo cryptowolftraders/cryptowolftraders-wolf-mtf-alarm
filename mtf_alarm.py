@@ -49,7 +49,7 @@ UPPER_BAND        = float(os.getenv("UPPER_BAND", "88"))
 LOWER_BAND        = float(os.getenv("LOWER_BAND", "12"))
 FUNDING_THRESHOLD = float(os.getenv("FUNDING_THRESHOLD", "0.01"))
 UNIVERSE          = int(os.getenv("UNIVERSE", "0"))
-FILTER_10PCT      = os.getenv("FILTER_10PCT", "true").lower() == "true"
+FILTER_10PCT      = os.getenv("FILTER_10PCT", "false").lower() == "true"
 RUN_NOW           = os.getenv("RUN_NOW", "false").lower() == "true"
 
 FAST_UNIVERSE     = int(os.getenv("FAST_UNIVERSE", "150"))
@@ -149,12 +149,32 @@ def get(path, params=None, retries=3):
     return None
 
 
+def fetch_valid_symbols():
+    """exchangeInfo -> sadece AKTİF (TRADING) PERPETUAL USDT kontratları.
+    Web MTF tarayıcısıyla birebir: delist/kapanan coini eler, yeni listeleneni dahil eder."""
+    try:
+        info = get("/fapi/v1/exchangeInfo")
+        valid = {
+            s["symbol"] for s in info.get("symbols", [])
+            if s.get("contractType") == "PERPETUAL"
+            and s.get("quoteAsset") == "USDT"
+            and s.get("status") == "TRADING"
+        }
+        return valid if valid else None
+    except Exception as e:
+        log(f"exchangeInfo hatası ({e}) — ham USDT listesine düşülüyor")
+        return None
+
+
 def fetch_universe(uni_limit=None):
-    """24h ticker -> hacme göre sıralı USDT-perp. uni_limit None ise global UNIVERSE."""
+    """24h ticker + exchangeInfo -> temiz, hacme göre sıralı USDT-perp evreni."""
     limit = UNIVERSE if uni_limit is None else uni_limit
     data = get("/fapi/v1/ticker/24hr")
-    coins = [d for d in data
-             if d["symbol"].endswith("USDT") and d["symbol"] not in EXCLUDE]
+    valid = fetch_valid_symbols()  # delist/yeni kontrolü (her taramada, hep taze)
+    if valid is not None:
+        coins = [d for d in data if d["symbol"] in valid and d["symbol"] not in EXCLUDE]
+    else:
+        coins = [d for d in data if d["symbol"].endswith("USDT") and d["symbol"] not in EXCLUDE]
     coins.sort(key=lambda d: float(d.get("quoteVolume", 0)), reverse=True)
     if FILTER_10PCT:
         coins = [d for d in coins if abs(float(d.get("priceChangePercent", 0))) < 10]
