@@ -10,8 +10,11 @@ coinleri Telegram'a atar. Hiçbir yerde İŞLEM AÇMAZ — sadece haber.
 İKİ ÇALIŞMA ŞEKLİ:
   1) OTOMATİK: her 4H kapanıştan 20 dk önce -> senin DM'ine (TELEGRAM_CHAT_ID)
   2) ELLE:     Wolf Signals Pro grubunda komutla -> sonuç GRUBA düşer
-       /tara       -> hızlı tarama (TOP 150)
-       /taratümü   -> tam tarama (~tüm perp, 10-15 dk)
+       /tara            -> MTF+Funding hızlı tarama (TOP 150)
+       /taratümü        -> MTF+Funding tam tarama (~tüm perp, 10-15 dk)
+       /alpha           -> Alpha Predator (RSI Hunter) hızlı tarama (TOP 150)
+       /taratümüalpha   -> Alpha Predator tam tarama (~tüm perp)
+         · TF argümanı verilebilir: /taratümüalpha 60  (1,3,5,15,30,60,240,D)
      * Komut SADECE grupta (TELEGRAM_GROUP_ID) çalışır; DM/başka sohbet yok sayılır.
      * Grupta yazabilen zaten üyedir -> "sadece üyeler" otomatik sağlanır.
      * Cooldown + tek-çalışma kilidi ile spam engellenir.
@@ -26,7 +29,11 @@ ENV (Railway -> Variables):
   COOLDOWN_MIN         (vars 10)   - iki elle tarama arası min. dakika
   TI_LEN(12) UPPER_BAND(88) LOWER_BAND(12) FUNDING_THRESHOLD(0.01)
   UNIVERSE(0=tümü) FILTER_10PCT(true) RUN_NOW(false)
-  FAST_UNIVERSE(150) - /tara hızlı taramada kaç coin
+  FAST_UNIVERSE(150) - hızlı taramada kaç coin
+
+  ALPHA (RSI Hunter) ENV:
+  ALPHA_TF(15) ALPHA_RSI_PERIOD(14) ALPHA_OB(70) ALPHA_OS(30)
+  ALPHA_CANDLES(100) ALPHA_WORKERS(6)
 """
 
 import os
@@ -59,6 +66,37 @@ POLL_TIMEOUT      = int(os.getenv("POLL_TIMEOUT", "50"))
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TG_GROUP = os.getenv("TELEGRAM_GROUP_ID", "-1004439903866").strip()
+
+# ── ALPHA PREDATOR (RSI Hunter) ayarları ──
+ALPHA_TF         = os.getenv("ALPHA_TF", "15").strip()
+ALPHA_RSI_PERIOD = int(os.getenv("ALPHA_RSI_PERIOD", "14"))
+ALPHA_OB         = float(os.getenv("ALPHA_OB", "70"))
+ALPHA_OS         = float(os.getenv("ALPHA_OS", "30"))
+ALPHA_CANDLES    = int(os.getenv("ALPHA_CANDLES", "100"))
+ALPHA_WORKERS    = int(os.getenv("ALPHA_WORKERS", "6"))
+
+# Web tarayıcısındaki MTF_MAP'in birebir Python karşılığı
+ALPHA_MTF_MAP = {
+    "1":   ("15",  "60"),
+    "3":   ("15",  "60"),
+    "5":   ("60",  "240"),
+    "15":  ("60",  "240"),
+    "30":  ("60",  "240"),
+    "60":  ("240", "D"),
+    "240": ("D",   "W"),
+    "D":   ("W",   "M"),
+}
+ALPHA_TF_API = {
+    "1": "1m", "3": "3m", "5": "5m", "15": "15m", "30": "30m",
+    "60": "1h", "120": "2h", "240": "4h", "360": "6h", "720": "12h",
+    "D": "1d", "W": "1w", "M": "1M",
+}
+ALPHA_TF_LABEL = {
+    "1": "1m", "3": "3m", "5": "5m", "15": "15m", "30": "30m",
+    "60": "1H", "240": "4H", "D": "1G", "W": "1Hf", "M": "1A",
+}
+
+_last_alpha_ts = 0.0               # alpha taramaları için ayrı cooldown
 
 EXCLUDE = {"BTCDOMUSDT", "DEFIUSDT", "BLUEBIRDUSDT", "BTCSTUSDT"}
 KLINE_LIMIT = TI_LEN + 8
@@ -261,6 +299,163 @@ def fmt_price(p):
 
 
 # ─────────────────────────────────────────────
+# ALPHA PREDATOR — RSI Hunter (web tarayıcısının Python portu)
+# ─────────────────────────────────────────────
+def calc_rsi(closes, period=None):
+    """Wilder RSI — rsi-hunter.html'deki calcRSI ile birebir aynı."""
+    p = ALPHA_RSI_PERIOD if period is None else period
+    if not closes or len(closes) < p + 1:
+        return None
+    gains = losses = 0.0
+    for i in range(1, p + 1):
+        d = closes[i] - closes[i - 1]
+        if d >= 0:
+            gains += d
+        else:
+            losses -= d
+    avg_gain = gains / p
+    avg_loss = losses / p
+    for i in range(p + 1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        g = d if d > 0 else 0.0
+        l = -d if d < 0 else 0.0
+        avg_gain = (avg_gain * (p - 1) + g) / p
+        avg_loss = (avg_loss * (p - 1) + l) / p
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def fetch_closes_n(symbol, tf_code, limit=None):
+    """TF kodunu (15, 60, 240, D...) Binance interval'ine çevirip kapanışları getirir."""
+    iv = ALPHA_TF_API.get(tf_code, tf_code)
+    data = get("/fapi/v1/klines",
+               {"symbol": symbol, "interval": iv, "limit": limit or ALPHA_CANDLES})
+    if not data:
+        return None
+    return [float(k[4]) for k in data]
+
+
+def evaluate_alpha(symbol, meta, funding, tf):
+    """Ultra Long: 3 TF'de de RSI < OS · Ultra Short: 3 TF'de de RSI > OB.
+    Önce mevcut TF bakılır; bant dışında değilse üst TF'ler hiç çekilmez (API tasarrufu)."""
+    up1, up2 = ALPHA_MTF_MAP.get(tf, ALPHA_MTF_MAP["15"])
+    try:
+        c1 = fetch_closes_n(symbol, tf)
+        r1 = calc_rsi(c1)
+        if r1 is None:
+            return None
+
+        if r1 < ALPHA_OS:
+            want = "ultra-long"
+        elif r1 > ALPHA_OB:
+            want = "ultra-short"
+        else:
+            return None                      # erken çıkış — üst TF'lere gerek yok
+
+        c2 = fetch_closes_n(symbol, up1)
+        r2 = calc_rsi(c2)
+        if r2 is None:
+            return None
+        if want == "ultra-long" and not (r2 < ALPHA_OS):
+            return None
+        if want == "ultra-short" and not (r2 > ALPHA_OB):
+            return None
+
+        c3 = fetch_closes_n(symbol, up2)
+        r3 = calc_rsi(c3)
+        if r3 is None:
+            return None
+        if want == "ultra-long" and not (r3 < ALPHA_OS):
+            return None
+        if want == "ultra-short" and not (r3 > ALPHA_OB):
+            return None
+
+        return {
+            "symbol": symbol,
+            "type": want,
+            "tfs": [tf, up1, up2],
+            "rsi": [round(r1, 1), round(r2, 1), round(r3, 1)],
+            "price": meta["price"],
+            "change24h": meta["change24h"],
+            "volume": meta["volume"],
+            "funding": funding.get(symbol),
+        }
+    except Exception:
+        return None
+
+
+def _alpha_row(h):
+    tf_lbl = "/".join(ALPHA_TF_LABEL.get(t, t) for t in h["tfs"])
+    rsi_txt = " / ".join(f"{v:.1f}" for v in h["rsi"])
+    fr = h["funding"]
+    fr_txt = f"  fund:{fr:+.4f}%" if fr is not None else ""
+    return (f"• <b>{h['symbol'].replace('USDT','')}</b>  {fmt_price(h['price'])}  "
+            f"RSI({tf_lbl}): {rsi_txt}{fr_txt}")
+
+
+def send_alpha_results(scanned, longs, shorts, tf, chat_id, mode_label):
+    now3 = datetime.now(TZ3).strftime("%d.%m %H:%M")
+    up1, up2 = ALPHA_MTF_MAP.get(tf, ALPHA_MTF_MAP["15"])
+    tf_lbl = " + ".join(ALPHA_TF_LABEL.get(t, t) for t in (tf, up1, up2))
+    head = (f"🐺 <b>ALPHA PREDATOR — RSI HUNTER</b>\n"
+            f"🕐 Elle tarama · {mode_label} · {now3} (UTC+3)\n"
+            f"TF: {tf_lbl} · OS&lt;{ALPHA_OS:g} / OB&gt;{ALPHA_OB:g}\n"
+            f"Taranan: {scanned} · ▲ ULTRA LONG: {len(longs)} · ▼ ULTRA SHORT: {len(shorts)}")
+
+    if not longs and not shorts:
+        send_telegram(head + "\n\n— 3 TF'de birden RSI uyumu sağlayan coin yok.", chat_id)
+        return
+
+    parts = [head]
+    if longs:
+        parts.append("\n▲ <b>ULTRA LONG</b> (3 TF aşırı satım)")
+        parts += [_alpha_row(h) for h in longs]
+    if shorts:
+        parts.append("\n▼ <b>ULTRA SHORT</b> (3 TF aşırı alım)")
+        parts += [_alpha_row(h) for h in shorts]
+    send_telegram("\n".join(parts), chat_id)
+
+
+def run_alpha_scan(chat_id, uni_limit=None, tf=None, mode_label="", tag="alpha"):
+    tf = (tf or ALPHA_TF)
+    if tf not in ALPHA_MTF_MAP:
+        tf = "15"
+    with SCAN_LOCK:
+        log(f"[{tag}] Alpha Predator taraması başlıyor… TF={tf}")
+        try:
+            universe = fetch_universe(uni_limit)
+            funding = fetch_funding_all()
+        except Exception as e:
+            log(f"Veri çekme hatası: {e}")
+            send_telegram(f"🐺 ALPHA PREDATOR — veri hatası: {html.escape(str(e))}", chat_id)
+            return
+
+        log(f"[{tag}] {len(universe)} coin taranıyor")
+
+        hits = []
+        with ThreadPoolExecutor(max_workers=ALPHA_WORKERS) as ex:
+            futs = {ex.submit(evaluate_alpha, s, m, funding, tf): s
+                    for s, m in universe.items()}
+            for fut in as_completed(futs):
+                try:
+                    r = fut.result()
+                except Exception:
+                    r = None
+                if r:
+                    hits.append(r)
+
+        longs = sorted([h for h in hits if h["type"] == "ultra-long"],
+                       key=lambda x: x["volume"], reverse=True)
+        shorts = sorted([h for h in hits if h["type"] == "ultra-short"],
+                        key=lambda x: x["volume"], reverse=True)
+
+        log(f"[{tag}] Sonuç: ULTRA LONG {len(longs)} · ULTRA SHORT {len(shorts)}")
+        send_alpha_results(len(universe), longs, shorts, tf, chat_id, mode_label)
+
+
+# ─────────────────────────────────────────────
 # TARAMA (chat_id parametreli: DM veya grup)
 # ─────────────────────────────────────────────
 def run_scan(chat_id, uni_limit=None, manual=False, mode_label="", tag="sched"):
@@ -366,6 +561,49 @@ def send_results(scanned, longs, shorts, chat_id=None, manual=False, mode_label=
 # ─────────────────────────────────────────────
 # KOMUT DİNLEYİCİ (getUpdates long-poll)
 # ─────────────────────────────────────────────
+ALPHA_CMDS_FULL = ("/taratümüalpha", "/taratumualpha", "/alphatümü", "/alphatumu")
+ALPHA_CMDS_FAST = ("/alpha", "/taraalpha")
+
+
+def handle_alpha_command(cmd, arg, chat_id):
+    """Alpha Predator (RSI Hunter) komutları."""
+    global _last_alpha_ts
+
+    full = cmd in ALPHA_CMDS_FULL or arg in ("tümü", "tumu", "full", "all", "hepsi")
+
+    # TF argümanı: /alpha 60  ·  /taratümüalpha 240
+    tf = ALPHA_TF
+    a = arg.upper() if arg else ""
+    if a in ALPHA_MTF_MAP:
+        tf = a
+    elif a.rstrip("M").isdigit() and a.rstrip("M") in ALPHA_MTF_MAP:
+        tf = a.rstrip("M")
+
+    now = time.time()
+    remain = COOLDOWN_MIN * 60 - (now - _last_alpha_ts)
+    if remain > 0:
+        send_telegram(f"⏳ Son Alpha taramasından bu yana {COOLDOWN_MIN} dk geçmedi. "
+                      f"{int(remain // 60)}dk {int(remain % 60)}sn sonra tekrar dene.", chat_id)
+        return
+    if SCAN_LOCK.locked():
+        send_telegram("⏳ Tarama zaten sürüyor — bitince buraya düşecek.", chat_id)
+        return
+
+    _last_alpha_ts = now
+    mode_label = "TÜMÜ" if full else "Hızlı (TOP %d)" % FAST_UNIVERSE
+    uni = 0 if full else FAST_UNIVERSE
+    up1, up2 = ALPHA_MTF_MAP.get(tf, ALPHA_MTF_MAP["15"])
+    tf_lbl = " + ".join(ALPHA_TF_LABEL.get(t, t) for t in (tf, up1, up2))
+    send_telegram(f"🐺 <b>Alpha Predator taraması başladı</b> — {mode_label} · TF: {tf_lbl}. "
+                  f"Bitince sonuçlar buraya düşecek (birkaç dk).", chat_id)
+    threading.Thread(
+        target=run_alpha_scan,
+        kwargs=dict(chat_id=chat_id, uni_limit=uni, tf=tf,
+                    mode_label=mode_label, tag="alpha-cmd"),
+        daemon=True,
+    ).start()
+
+
 def handle_command(text, chat_id):
     global _last_cmd_ts
     parts = text.strip().split()
@@ -375,6 +613,16 @@ def handle_command(text, chat_id):
     if "@" in cmd:                      # /tara@BotAdi -> /tara
         cmd = cmd.split("@", 1)[0]
     arg = parts[1].lower() if len(parts) > 1 else ""
+
+    # ── Alpha Predator komutları (MTF'den ÖNCE kontrol edilmeli) ──
+    if cmd in ALPHA_CMDS_FULL or cmd in ALPHA_CMDS_FAST:
+        handle_alpha_command(cmd, arg, chat_id)
+        return
+    # /tara alpha  ·  /taratümü alpha  şeklinde de çalışsın
+    if cmd in ("/tara", "/taratümü", "/taratumu") and arg in ("alpha", "alfa"):
+        alias = "/taratumualpha" if cmd in ("/taratümü", "/taratumu") else "/alpha"
+        handle_alpha_command(alias, "", chat_id)
+        return
 
     if cmd not in ("/tara", "/taratümü", "/taratumu"):
         return
@@ -414,7 +662,8 @@ def poll_commands():
                          params={"drop_pending_updates": "true"}, timeout=10)
     except Exception:
         pass
-    log(f"👂 Komut dinleyici aktif — grup {TG_GROUP} · /tara, /taratümü")
+    log(f"👂 Komut dinleyici aktif — grup {TG_GROUP} · "
+        f"/tara, /taratümü, /alpha, /taratümüalpha")
     offset = None
     while True:
         try:
@@ -439,7 +688,8 @@ def poll_commands():
                 if not msg:
                     continue
                 txt = msg.get("text", "")
-                if not txt or not txt.lstrip().startswith("/tara"):
+                t0 = txt.lstrip() if txt else ""
+                if not (t0.startswith("/tara") or t0.startswith("/alpha")):
                     continue
                 cid = msg.get("chat", {}).get("id")
                 # SADECE tanımlı grup; DM/başka sohbet yok say
@@ -478,6 +728,8 @@ def main():
     log(f"Ayar: TI_LEN={TI_LEN} LOWER={LOWER_BAND} UPPER={UPPER_BAND} "
         f"FUND_THR={FUNDING_THRESHOLD} UNIVERSE={'ALL' if UNIVERSE==0 else UNIVERSE} "
         f"FILTER_10PCT={FILTER_10PCT} FAST={FAST_UNIVERSE} COOLDOWN={COOLDOWN_MIN}dk")
+    log(f"Alpha: TF={ALPHA_TF} RSI={ALPHA_RSI_PERIOD} OS={ALPHA_OS} OB={ALPHA_OB} "
+        f"CANDLES={ALPHA_CANDLES} WORKERS={ALPHA_WORKERS}")
     if not TG_TOKEN or not TG_CHAT:
         log("⚠ Telegram env eksik — otomatik alarm sadece log'a yazılır.")
 
