@@ -19,6 +19,9 @@ coinleri Telegram'a atar. Hiçbir yerde İŞLEM AÇMAZ — sadece haber.
      * Komut SADECE grupta (TELEGRAM_GROUP_ID) çalışır; DM/başka sohbet yok sayılır.
      * Grupta yazabilen zaten üyedir -> "sadece üyeler" otomatik sağlanır.
      * Cooldown + tek-çalışma kilidi ile spam engellenir.
+  3) MTF KONUSU MODERASYONU: TELEGRAM_KONU konusunda sadece yukarıdaki komutlar
+     kalır; üyelerin normal mesajı bot tarafından silinir. Grup yöneticileri,
+     WOLF_ADMIN_IDS ve botlar muaf. (Bot yöneticisinde "Mesajları sil" yetkisi gerekir.)
 
 Zamanlama (otomatik):
   UTC kapanışlar: 00/04/08/12/16/20 · Çalışma (UTC+3): 02:40/06:40/10:40/14:40/18:40/22:40
@@ -35,6 +38,8 @@ ENV (Railway -> Variables):
   TI_LEN(12) UPPER_BAND(88) LOWER_BAND(12) FUNDING_THRESHOLD(0.01)
   UNIVERSE(0=tümü) FILTER_10PCT(true) RUN_NOW(false)
   FAST_UNIVERSE(150) - hızlı taramada kaç coin
+  MTF_MODERASYON       (vars true) - MTF konusunda komut dışı mesajları sil
+  WOLF_ADMIN_IDS       (vars 1559558410) - her zaman muaf kullanıcı ID'leri (virgülle)
 
   ALPHA (RSI Hunter) ENV:
   ALPHA_TF(15) ALPHA_RSI_PERIOD(14) ALPHA_OB(70) ALPHA_OS(30)
@@ -695,6 +700,61 @@ def set_bot_commands():
         log(f"Komut menüsü hatası: {e}")
 
 
+# ─────────────────────────────────────────────
+# MTF KONUSU MODERASYONU — sadece komutlar kalsın
+# ─────────────────────────────────────────────
+MTF_MOD = os.getenv("MTF_MODERASYON", "true").lower() == "true"
+ADMIN_IDS = {int(x) for x in os.getenv("WOLF_ADMIN_IDS", "1559558410").replace(" ", "").split(",")
+             if x.lstrip("-").isdigit()}
+ALLOWED_CMDS = {"/tara", "/taratümü", "/taratumu", *ALPHA_CMDS_FULL, *ALPHA_CMDS_FAST}
+_admin_cache = {"ids": set(), "ts": 0.0}
+
+
+def group_admin_ids(chat_id):
+    """Grup yöneticileri (10 dk önbellek) + WOLF_ADMIN_IDS."""
+    now = time.time()
+    if now - _admin_cache["ts"] > 600:
+        try:
+            r = POLL_SESSION.get(f"https://api.telegram.org/bot{TG_TOKEN}/getChatAdministrators",
+                                 params={"chat_id": chat_id}, timeout=12).json()
+            if r.get("ok"):
+                _admin_cache["ids"] = {m["user"]["id"] for m in r.get("result", [])}
+                _admin_cache["ts"] = now
+            else:
+                log(f"getChatAdministrators hata: {str(r)[:200]}")
+        except Exception as e:
+            log(f"getChatAdministrators hata: {e}")
+    return _admin_cache["ids"] | ADMIN_IDS
+
+
+def moderate_mtf(msg):
+    """MTF konusunda komut olmayan üye mesajını siler. Silindiyse True döner."""
+    if not MTF_MOD or not TG_KONU:
+        return False
+    if str(msg.get("message_thread_id", "")) != str(TG_KONU):
+        return False
+    frm = msg.get("from") or {}
+    if frm.get("is_bot") or msg.get("sender_chat"):      # botlar + anonim yöneticiler
+        return False
+    cid = msg.get("chat", {}).get("id")
+    if frm.get("id") in group_admin_ids(cid):
+        return False
+    txt = (msg.get("text") or "").strip()
+    if txt:
+        first = txt.split()[0].lower().split("@", 1)[0]
+        if first in ALLOWED_CMDS:
+            return False
+    try:
+        r = POLL_SESSION.post(f"https://api.telegram.org/bot{TG_TOKEN}/deleteMessage",
+                              json={"chat_id": cid, "message_id": msg["message_id"]}, timeout=12)
+        ok = r.status_code == 200 and r.json().get("ok")
+        log(f"🧹 MTF: komut dışı mesaj {'silindi' if ok else 'SİLİNEMEDİ ' + r.text[:150]} "
+            f"· {frm.get('id')} {frm.get('first_name', '')}")
+    except Exception as e:
+        log(f"MTF silme hatası: {e}")
+    return True
+
+
 def poll_commands():
     if not TG_TOKEN:
         log("⚠ Token yok — komut dinleyici kapalı.")
@@ -706,7 +766,7 @@ def poll_commands():
     except Exception:
         pass
     log(f"👂 Komut dinleyici aktif — grup {TG_GROUP} · konu {TG_KONU or '-'} · "
-        f"/tara, /taratümü, /alpha, /taratümüalpha")
+        f"/tara, /taratümü, /alpha, /taratümüalpha · MTF moderasyon {'AÇIK' if MTF_MOD else 'kapalı'}")
     offset = None
     while True:
         try:
@@ -729,6 +789,8 @@ def poll_commands():
                 offset = upd["update_id"] + 1
                 msg = upd.get("message")
                 if not msg:
+                    continue
+                if group_matches(msg.get("chat", {}).get("id")) and moderate_mtf(msg):
                     continue
                 txt = msg.get("text", "")
                 t0 = txt.lstrip() if txt else ""
