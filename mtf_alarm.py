@@ -22,6 +22,8 @@ coinleri Telegram'a atar. Hiçbir yerde İŞLEM AÇMAZ — sadece haber.
   3) MTF KONUSU MODERASYONU: TELEGRAM_KONU konusunda sadece yukarıdaki komutlar
      kalır; üyelerin normal mesajı bot tarafından silinir. Grup yöneticileri,
      WOLF_ADMIN_IDS ve botlar muaf. (Bot yöneticisinde "Mesajları sil" yetkisi gerekir.)
+  4) PNL KONUSU: PNL_KONU konusunda üyeler sadece resim atabilir (açıklama serbest);
+     resim olmayan mesajlar silinir. Aynı muafiyetler geçerli.
 
 Zamanlama (otomatik):
   UTC kapanışlar: 00/04/08/12/16/20 · Çalışma (UTC+3): 02:40/06:40/10:40/14:40/18:40/22:40
@@ -40,6 +42,7 @@ ENV (Railway -> Variables):
   FAST_UNIVERSE(150) - hızlı taramada kaç coin
   MTF_MODERASYON       (vars true) - MTF konusunda komut dışı mesajları sil
   WOLF_ADMIN_IDS       (vars 1559558410) - her zaman muaf kullanıcı ID'leri (virgülle)
+  PNL_KONU             (vars 24) - sadece resim atılabilen PNL konusu (boş = kapalı)
 
   ALPHA (RSI Hunter) ENV:
   ALPHA_TF(15) ALPHA_RSI_PERIOD(14) ALPHA_OB(70) ALPHA_OS(30)
@@ -704,6 +707,7 @@ def set_bot_commands():
 # MTF KONUSU MODERASYONU — sadece komutlar kalsın
 # ─────────────────────────────────────────────
 MTF_MOD = os.getenv("MTF_MODERASYON", "true").lower() == "true"
+PNL_KONU = os.getenv("PNL_KONU", "24").strip()
 ADMIN_IDS = {int(x) for x in os.getenv("WOLF_ADMIN_IDS", "1559558410").replace(" ", "").split(",")
              if x.lstrip("-").isdigit()}
 ALLOWED_CMDS = {"/tara", "/taratümü", "/taratumu", *ALPHA_CMDS_FULL, *ALPHA_CMDS_FAST}
@@ -727,31 +731,49 @@ def group_admin_ids(chat_id):
     return _admin_cache["ids"] | ADMIN_IDS
 
 
+def _is_image(msg):
+    if msg.get("photo"):
+        return True
+    doc = msg.get("document") or {}
+    return str(doc.get("mime_type", "")).startswith("image/")
+
+
+def _delete(msg, why):
+    frm = msg.get("from") or {}
+    cid = msg.get("chat", {}).get("id")
+    try:
+        r = POLL_SESSION.post(f"https://api.telegram.org/bot{TG_TOKEN}/deleteMessage",
+                              json={"chat_id": cid, "message_id": msg["message_id"]}, timeout=12)
+        ok = r.status_code == 200 and r.json().get("ok")
+        log(f"🧹 {why}: {'silindi' if ok else 'SİLİNEMEDİ ' + r.text[:150]} "
+            f"· {frm.get('id')} {frm.get('first_name', '')}")
+    except Exception as e:
+        log(f"Silme hatası ({why}): {e}")
+
+
 def moderate_mtf(msg):
-    """MTF konusunda komut olmayan üye mesajını siler. Silindiyse True döner."""
-    if not MTF_MOD or not TG_KONU:
-        return False
-    if str(msg.get("message_thread_id", "")) != str(TG_KONU):
+    """MTF: sadece komutlar · PNL: sadece resim. Üye mesajı silindiyse True döner."""
+    thread = str(msg.get("message_thread_id", ""))
+    in_mtf = bool(MTF_MOD and TG_KONU and thread == str(TG_KONU))
+    in_pnl = bool(PNL_KONU and thread == str(PNL_KONU))
+    if not (in_mtf or in_pnl):
         return False
     frm = msg.get("from") or {}
     if frm.get("is_bot") or msg.get("sender_chat"):      # botlar + anonim yöneticiler
         return False
-    cid = msg.get("chat", {}).get("id")
-    if frm.get("id") in group_admin_ids(cid):
+    if frm.get("id") in group_admin_ids(msg.get("chat", {}).get("id")):
         return False
+    if in_pnl:
+        if _is_image(msg):
+            return False
+        _delete(msg, "PNL: resim olmayan mesaj")
+        return True
     txt = (msg.get("text") or "").strip()
     if txt:
         first = txt.split()[0].lower().split("@", 1)[0]
         if first in ALLOWED_CMDS:
             return False
-    try:
-        r = POLL_SESSION.post(f"https://api.telegram.org/bot{TG_TOKEN}/deleteMessage",
-                              json={"chat_id": cid, "message_id": msg["message_id"]}, timeout=12)
-        ok = r.status_code == 200 and r.json().get("ok")
-        log(f"🧹 MTF: komut dışı mesaj {'silindi' if ok else 'SİLİNEMEDİ ' + r.text[:150]} "
-            f"· {frm.get('id')} {frm.get('first_name', '')}")
-    except Exception as e:
-        log(f"MTF silme hatası: {e}")
+    _delete(msg, "MTF: komut dışı mesaj")
     return True
 
 
@@ -766,7 +788,7 @@ def poll_commands():
     except Exception:
         pass
     log(f"👂 Komut dinleyici aktif — grup {TG_GROUP} · konu {TG_KONU or '-'} · "
-        f"/tara, /taratümü, /alpha, /taratümüalpha · MTF moderasyon {'AÇIK' if MTF_MOD else 'kapalı'}")
+        f"/tara, /taratümü, /alpha, /taratümüalpha · MTF moderasyon {'AÇIK' if MTF_MOD else 'kapalı'} · PNL konu {PNL_KONU or '-'}")
     offset = None
     while True:
         try:
