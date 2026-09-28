@@ -8,8 +8,9 @@ funding yönü filtresini sunucu tarafında çalıştırır ve eşleşen
 coinleri Telegram'a atar. Hiçbir yerde İŞLEM AÇMAZ — sadece haber.
 
 İKİ ÇALIŞMA ŞEKLİ:
-  1) OTOMATİK: her 4H kapanıştan 20 dk önce -> senin DM'ine (TELEGRAM_CHAT_ID)
-  2) ELLE:     Wolf Signals Pro grubunda komutla -> sonuç GRUBA düşer
+  1) OTOMATİK: her 4H kapanıştan 20 dk önce -> TELEGRAM_CHAT_ID (28.09.2026'dan beri
+     Wolf Komuta grubu, MTF konusu)
+  2) ELLE:     grupta komutla -> sonuç aynı gruba / MTF konusuna düşer
        /tara            -> MTF+Funding hızlı tarama (TOP 150)
        /taratümü        -> MTF+Funding tam tarama (~tüm perp, 10-15 dk)
        /alpha           -> Alpha Predator (RSI Hunter) hızlı tarama (TOP 150)
@@ -24,8 +25,12 @@ Zamanlama (otomatik):
 
 ENV (Railway -> Variables):
   TELEGRAM_BOT_TOKEN   (zorunlu)
-  TELEGRAM_CHAT_ID     (zorunlu)   - otomatik alarmın gideceği DM
-  TELEGRAM_GROUP_ID    (vars -5025422334) - komutların çalışacağı grup
+  TELEGRAM_CHAT_ID     (zorunlu)   - otomatik alarmın gideceği sohbet
+  TELEGRAM_GROUP_ID    - komutların çalışacağı grup
+  TELEGRAM_KONU        (ops.) grup konusu (topic) numarası — gruba giden HER mesaj
+                       (otomatik alarm + komut cevapları) bu konuya düşer.
+                       Boşsa grubun genel akışına gider. Numara hatalıysa mesaj
+                       konusuz tekrar gönderilir (kaybolmaz).
   COOLDOWN_MIN         (vars 10)   - iki elle tarama arası min. dakika
   TI_LEN(12) UPPER_BAND(88) LOWER_BAND(12) FUNDING_THRESHOLD(0.01)
   UNIVERSE(0=tümü) FILTER_10PCT(true) RUN_NOW(false)
@@ -66,6 +71,7 @@ POLL_TIMEOUT      = int(os.getenv("POLL_TIMEOUT", "50"))
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TG_GROUP = os.getenv("TELEGRAM_GROUP_ID", "-1004439903866").strip()
+TG_KONU  = os.getenv("TELEGRAM_KONU", "").strip()
 
 # ── ALPHA PREDATOR (RSI Hunter) ayarları ──
 ALPHA_TF         = os.getenv("ALPHA_TF", "15").strip()
@@ -500,14 +506,23 @@ def send_telegram(text, chat_id=None):
         log("⚠ TELEGRAM_BOT_TOKEN / chat_id yok — mesaj atlanıyor")
         return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    # Gruba giden mesaj MTF konusuna (topic) düşer; DM'e giden konusuz.
+    konu = TG_KONU if (TG_KONU and group_matches(cid) and str(cid).startswith("-")) else ""
     for chunk in _split(text, 3900):
         try:
-            resp = SESSION.post(url, json={
+            body = {
                 "chat_id": cid,
                 "text": chunk,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": True,
-            }, timeout=12)
+            }
+            if konu:
+                body["message_thread_id"] = int(konu)
+            resp = SESSION.post(url, json=body, timeout=12)
+            if resp.status_code == 400 and konu and "thread" in resp.text.lower():
+                log(f"Telegram: konu {konu} bulunamadı — konusuz gönderiliyor")
+                body.pop("message_thread_id", None)
+                resp = SESSION.post(url, json=body, timeout=12)
             if resp.status_code != 200:
                 log(f"Telegram hata {resp.status_code}: {resp.text[:200]}")
         except Exception as e:
@@ -662,7 +677,7 @@ def poll_commands():
                          params={"drop_pending_updates": "true"}, timeout=10)
     except Exception:
         pass
-    log(f"👂 Komut dinleyici aktif — grup {TG_GROUP} · "
+    log(f"👂 Komut dinleyici aktif — grup {TG_GROUP} · konu {TG_KONU or '-'} · "
         f"/tara, /taratümü, /alpha, /taratümüalpha")
     offset = None
     while True:
@@ -747,7 +762,7 @@ def main():
             f"— {int(wait)}sn sonra")
         time.sleep(max(1, wait))
         try:
-            run_scan(TG_CHAT, tag="sched")   # otomatik -> DM'e
+            run_scan(TG_CHAT, tag="sched")   # otomatik -> TELEGRAM_CHAT_ID
         except Exception as e:
             log(f"Tarama beklenmedik hata: {e}")
         time.sleep(60)
