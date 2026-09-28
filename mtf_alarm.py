@@ -667,6 +667,34 @@ def handle_command(text, chat_id):
     ).start()
 
 
+# Mesaj kutusunun yanındaki "/" menüsünde görünecek komutlar (sadece bu grupta)
+BOT_COMMANDS = [
+    ("tara",          "MTF + Funding hızlı tarama (TOP 150)"),
+    ("taratumu",      "MTF + Funding tüm coinler"),
+    ("alpha",         "Alpha Predator hızlı tarama (TOP 150)"),
+    ("taratumualpha", "Alpha Predator tüm coinler"),
+]
+
+
+def set_bot_commands():
+    """setMyCommands — komut menüsünü SADECE TELEGRAM_GROUP_ID grubuna kurar."""
+    if not TG_TOKEN or not TG_GROUP:
+        return
+    try:
+        body = {
+            "commands": [{"command": c, "description": d} for c, d in BOT_COMMANDS],
+            "scope": {"type": "chat", "chat_id": int(TG_GROUP)},
+        }
+        r = SESSION.post(f"https://api.telegram.org/bot{TG_TOKEN}/setMyCommands",
+                         json=body, timeout=12)
+        if r.status_code == 200 and r.json().get("ok"):
+            log(f"📋 Komut menüsü kuruldu — grup {TG_GROUP}")
+        else:
+            log(f"Komut menüsü kurulamadı {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        log(f"Komut menüsü hatası: {e}")
+
+
 def poll_commands():
     if not TG_TOKEN:
         log("⚠ Token yok — komut dinleyici kapalı.")
@@ -747,6 +775,8 @@ def main():
         f"CANDLES={ALPHA_CANDLES} WORKERS={ALPHA_WORKERS}")
     if not TG_TOKEN or not TG_CHAT:
         log("⚠ Telegram env eksik — otomatik alarm sadece log'a yazılır.")
+
+    set_bot_commands()
 
     # Komut dinleyiciyi arka planda başlat
     threading.Thread(target=poll_commands, daemon=True).start()
